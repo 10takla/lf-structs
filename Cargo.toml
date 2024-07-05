@@ -1,0 +1,13 @@
+[package]
+name = "lf-structs"
+license = "MIT"
+authors = ["10takla <https://github.com/10takla>"]
+description = "Various implementations of free locking and atomicity of data structures"
+keyword = ["lock_free", "atomic", "concurrency_primitives", "locks"]
+version = "0.1.0"
+repository = "https://github.com/10takla/lf-structs"
+edition = "2018"
+
+[dependencies]
+atomic-wait = "1.1.0"
+std-reset = {path = "../std_reset"}
