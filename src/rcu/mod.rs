@@ -1,4 +1,6 @@
-use std::cell::RefCell;
+use arc_rcu::ArcRcu;
+use rcu_with_garbage_collector::RcuGC;
+use std::cell::{RefCell, UnsafeCell};
 use std::fmt::{Debug, Display};
 use std::ops::DerefMut;
 use std::sync::atomic::{AtomicU32, Ordering::*};
@@ -7,6 +9,9 @@ use std::thread;
 use std::time::Instant;
 use std::{ops::Deref, sync::atomic::AtomicPtr};
 use std_reset::prelude::Display;
+
+pub mod rcu_with_garbage_collector;
+pub mod arc_rcu;
 
 #[derive(Debug)]
 pub struct Rcu<T> {
@@ -35,18 +40,6 @@ impl<T: Clone> Clone for Rcu<T> {
     }
 }
 
-impl<T> Deref for Rcu<T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.ptr.load(Relaxed) }
-    }
-}
-// Для неатомарного измения данных
-// impl<T> DerefMut for Rcu<T> {
-//     fn deref_mut(&mut self) -> &mut Self::Target {
-//         unsafe { &mut *self.ptr.load(Relaxed) }
-//     }
-// }
 impl<T> Rcu<T> {
     pub fn new(data: T) -> Self {
         Self {
@@ -56,9 +49,9 @@ impl<T> Rcu<T> {
 }
 impl<T: Clone> Rcu<T> {
     pub fn load(&self) -> T {
-        unsafe { &*self.ptr.load(Acquire) }.clone()
+        unsafe { &*self.ptr.load(Relaxed) }.clone()
     }
-    /// Изменяет данные на которые ссылается [`AtomicPtr`] атомарно
+    /// Атомарно изменяет данные на которые ссылается [`AtomicPtr`]
     pub fn change(&self, f: impl Fn(&mut T)) {
         let mut load_data = self.ptr.load(Acquire);
 
@@ -67,33 +60,50 @@ impl<T: Clone> Rcu<T> {
         // новыми данными (который дал другой параллельный поток),
         // до тех пор пока другой поток не сможет перебить текущий в гонке данных
         loop {
-            let mut changed_data = unsafe { &*load_data }.clone();
+            let mut changed_data = unsafe { &mut *load_data }.clone();
             f(&mut changed_data);
             let new_ptr = Box::into_raw(Box::new(changed_data));
-            match self.ptr.compare_exchange(
-                load_data,
-                new_ptr,
-                Release,
-                Relaxed,
-            ) {
+            match self
+                .ptr
+                .compare_exchange(load_data, new_ptr, AcqRel, Relaxed)
+            {
+                // утечка памяти
                 Ok(load_data) => {
-                    unsafe {
-                        Box::from_raw(load_data);
-                    }
                     break;
                 }
                 // если данные были изменены (параллельным потоком), то выполняем цикл с новыми данными
                 Err(e) => {
                     load_data = e;
                     unsafe {
+                        // предотвращение утечки
                         Box::from_raw(new_ptr);
                     }
-                },
+                }
             }
         }
     }
 }
 
+
+#[test]
+fn standard_use() {
+    let rcu = ArcRcu::new(0);
+    
+    thread::scope(|s| {
+        for _ in 0..1_000 {
+            s.spawn({
+                || {
+                    for _ in 0..1_000 {
+                        rcu.change(|data| {
+                            *data += 1;
+                        });
+                    }
+                }
+            });
+        }
+    });
+    assert_eq!(rcu.load(), 1_000_000);
+}
 
 #[test]
 fn test() {
@@ -176,7 +186,6 @@ fn counter() {
     println!("{:?} {:?}", counter, start.elapsed());
 }
 
-
 #[test]
 fn pref() {
     const N_THREADS: usize = 4;
@@ -189,7 +198,6 @@ fn pref() {
     let mut rcu_handles = vec![];
     for _ in 0..N_THREADS {
         let rcu = Arc::clone(&rcu);
-        
         rcu_handles.push(thread::spawn(move || {
             for _ in 0..N_ITERS {
                 rcu.change(|data| {
@@ -205,6 +213,8 @@ fn pref() {
 
     let rcu_duration = rcu_start.elapsed();
     let rcu_result = rcu.load();
+    thread::sleep(std::time::Duration::from_secs(4));
+    println!("{}", rcu.load());
 
     // Тестирование с использованием Mutex
     let mutex_data = Arc::new(Mutex::new(0usize));
@@ -228,6 +238,4 @@ fn pref() {
     let mutex_duration = mutex_start.elapsed();
     let mutex_result = *mutex_data.lock().unwrap();
 
-    println!("RCU Result: {}, Duration: {:?}", rcu_result, rcu_duration);
-    println!("Mutex Result: {}, Duration: {:?}", mutex_result, mutex_duration);
 }
